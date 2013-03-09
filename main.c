@@ -18,14 +18,14 @@
 #include "./USB/usb.h"
 #include "HardwareProfile.h"
 #include "./USB/usb_function_hid.h"
-#include "font.h"
+//#include "font.h"
 #include "eeprom.h"
 #include <delays.h>
-#include <string.h>
+//#include <string.h>
 
 //Andris includes
-#include <i2c.h>
-#include <sw_i2c.h>
+//#include <i2c.h>
+//#include <sw_i2c.h>
 #include "xlcd.h"
 
 
@@ -41,7 +41,7 @@
         #pragma config FCMEN    = OFF
         #pragma config IESO     = OFF
         #pragma config PWRT     = OFF
-        #pragma config BOR      = ON
+        #pragma config BOR      = OFF
         #pragma config BORV     = 3
         #pragma config VREGEN   = ON      //USB Voltage Regulator
         #pragma config WDT      = OFF
@@ -50,7 +50,7 @@
         #pragma config LPT1OSC  = ON   // KULONBEN NAGYON GYORSAN FUTOTT, EZ EGY HACK
         #pragma config PBADEN   = OFF
 //      #pragma config CCP2MX   = ON
-        #pragma config STVREN   = ON
+        #pragma config STVREN   = ON  // stack under/overflow causes reset
         #pragma config LVP      = OFF
 //      #pragma config ICPRT    = OFF       // Dedicated In-Circuit Debug/Programming
         #pragma config XINST    = OFF       // Extended Instruction Set
@@ -72,7 +72,7 @@
 //      #pragma config EBTR2    = OFF
 //      #pragma config EBTR3    = OFF
         #pragma config EBTRB    = OFF
-
+        #pragma config DEBUG    = OFF
 
 #pragma romdata
 
@@ -105,16 +105,18 @@ unsigned far char ToSendDataBuffer[USBSIZE];
 #define T_BAT   0b01100000
 #define T_BPM   0b10000000
 #define T_PP    0b10100000
-//#define T_DT    0b11000000
+#define T_TS    0b11000000
+#define T_REF   0b11100000  // voltage reference
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma udata
 
+unsigned char vref = 3;
+unsigned long last_vrefchg = 0;  // last time vref was changed
 
-
-unsigned long msec;
+unsigned long msec=0;
 float fmsec=0;
 
 unsigned long last_msec=0;
@@ -123,38 +125,30 @@ unsigned long sw_on=0;
 unsigned long eeprom_addr=0; // current address we are writing to
 
 float hgsr=0; // last GSR state
-float fgsr=0;
-int gsr_n=0;
+float fgsr=0; // running sum
+int gsr_n=0;  // running sample
+unsigned int nsim=0;   // nanosiemens
 
 char state=IDLE; // we start with idle state
 unsigned char meas=0; // current measurement
 unsigned long meas_start=0;
 int nmark=0;
-unsigned long last_tl = 0;
-unsigned char c=0;
-
-int n_inth=0; // number of high prio interrupts
-int n_intl=0; // number of low prio interrupts
 
 USB_HANDLE USBOutHandle = 0;
 USB_HANDLE USBInHandle = 0;
-BOOL blinkStatusValid = TRUE;
-
-unsigned char rtc_s, rtc_m, rtc_h;
-
+//BOOL blinkStatusValid = TRUE;
 
 unsigned long last_pulse=0;
-//int pulse=0; //last pulse reading
-double avg_pulse=0;
-double avg_pulse_fast=0;
-double pulse_level=0;
+float avg_pulse=0;
+float avg_pulse_fast=0;
+float pulse_level=0;
 int max_pulse = 0;
 int pp=0;
 
 int pulse_vec[10]={0,0,0,0,0,0,0,0,0,0};
 int pulse_vec_ptr = 0;
 
-int beat_detected = 0;
+char beat_detected = 0;
 
 int n_beat=0;
 unsigned long last_beat_calc=0;
@@ -168,16 +162,25 @@ unsigned int bat=0;
 //char bigbuf[128];
 int errcnt=0;
 
+unsigned long memsize=0;
+
 
 typedef struct Config {
-   unsigned int empty;
    unsigned int GSR_DT;     // GSR write period
    char WRITE_PP;    // if 1 write inter-pulse time
    unsigned int BPM_DT;  // BPM write period
-   unsigned long timestamp[2]; // java timestamp
 } Config ;
 
-Config conf = {0, 250, 1, 2, 0, 0};
+Config conf = {250, 1, 5000};
+
+typedef struct Timestamp {
+   unsigned long ts[2]; // unix timestamp * 1000 (8 bytes)
+   unsigned long msec;  // local time
+} Timestamp;
+
+Timestamp timestamp = {0 ,0};
+
+char write_ts=0;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -279,8 +282,10 @@ WORD_VAL ReadPOT(void);
 	
 	//These are your actual interrupt handling routines.
 	#pragma interrupt YourHighPriorityISRCode
-    float dt;
+    static float dt=0;
     int intf=0;
+    const unsigned char dtimer = 0b11111111; // ~7.5ms 
+    const unsigned char dtimerl = 128; // substr. approx 4ms
 	void YourHighPriorityISRCode()
 	{
 
@@ -289,10 +294,9 @@ WORD_VAL ReadPOT(void);
         if(PIR1bits.TMR1IF) {
            //unsigned char dtimer = 0b11111000; // 62.547727ms
            //const unsigned char dtimer = 0b11111110; // ~15ms 
-           const unsigned char dtimer = 0b11111111; // ~7.5ms 
-           const unsigned char dtimerl = 128; // substr. approx 4ms
 
-           n_inth++;
+
+           //n_inth++;
            intf=1;
            
            while((TMR1L&0x01));
@@ -300,9 +304,6 @@ WORD_VAL ReadPOT(void);
 
            TMR1L+=dtimerl;
            TMR1H = dtimer; 
-
-           dt = 1000.0 / 32768.0 * (65536-((float)dtimer*256));
-           dt-=1000.0*(128)/32768.0;
            
            fmsec += dt;
            msec = (unsigned long)fmsec;
@@ -346,19 +347,28 @@ WORD_VAL ReadPOT(void);
 void InitI2C(void)
 {
 
-return;
+return; // EZ EDDIG NEM VOLT KOMMENTELVE
 
 //OpenI2C(MASTER, SLEW_ON);
 //SSPADD=0x09;
 //return;
 
-  //here is the I2C setup from the Seeval32 code.
+  // SSPADD=(FOSC/(4*100 kHz))-1. 
+
+  // ha minden igaz, a FOSC = 24Mhz ==? SSPADD = 
+
   TRISBbits.RB1 = 1; //Configure SCL as Input
   TRISBbits.RB0 = 1; //Configure SDA as Input
-  SSPSTAT = 0x80;   //Disable SMBus & Slew Rate Control
+
+  SSPSTAT = 0x00;     // 400k mode
+  //SSPSTAT = 0x80;   // 100k and 1M mode
+
   SSPCON1 = 0x28;   //Enable MSSP Master
   //SSPADD = 0x18;    //Should be 0x18 for 100kHz
-  SSPADD = 0x7E;    //Should be 0x77 for 100kHz 
+  //SSPADD = 0x77;    //Should be 0x77 for 100kHz 
+
+  SSPADD = 14;
+
   SSPCON2 = 0x00;   //Clear MSSP Conrol Bits
 }
 
@@ -419,6 +429,8 @@ unsigned int ReadBattery(void) {
     ADCON2=0x3C;
     ADCON2bits.ADFM = 1;
 
+    ADCON1bits.VCFG1 = 0; // set voltage reference as negative baseline
+
     Delay_us(10);
 
     ADCON0bits.GO = 1;              // Start AD conversion
@@ -439,6 +451,7 @@ unsigned int ReadGsr(void) {
     ADCON2 = 0b10111110;
     ADCON2bits.ADFM = 1;
 
+    ADCON1bits.VCFG1 = 1; // set voltage reference as negative baseline
 
     Delay_us(10);
 
@@ -490,6 +503,7 @@ void PrintRec(void) {
    int gsr_i = (int)hgsr;
    int bpm_i = bpm;
    
+   char c;
 
    min = s / 60;
    sec = s - min * 60;
@@ -499,7 +513,10 @@ void PrintRec(void) {
    XLCDL1home();
    XLCDPutRamString(buf);
 
-   sprintf(buf, (const far rom char*)"P=%3d G=%3d  ", bpm_i, gsr_i);
+   if(timestamp.msec==0) c=' '; else c='*';
+   sprintf(buf, (const far rom char*)"P=%3d G=%3d %c", bpm_i, gsr_i, c);
+   //sprintf(buf, (const far rom char*)"%lu %d", eeprom_addr, errcnt);
+
    // %d%% %d", bpm, (int) blev, b);
    XLCDL2home();
    XLCDPutRamString(buf);
@@ -526,15 +543,15 @@ void PrintIdle(void) {
    // else sprintf( buf, "NOTC %d",USB_BUS_SENSE);
 
    blev = bat;
-   blev = 10.0*blev/1024.0;
+   blev = 5.0*blev/1024.0;
 
-   blev = (blev-7) / (9-7) * 100.0;
+   blev = (blev-1.5) / (2.4-1.5) * 100.0;
 
-   bb = (int)blev;
+   bb = (int)(blev);
    if(bb<0) bb = 0;
    if(bb>=100) bb=99;
 
-   f = 100.0 * (eeprom_addr) / 131072.0 ;
+   f = 100.0 * (eeprom_addr) / memsize ;
    fi = (int)f;
 
    XLCDL1home();
@@ -547,8 +564,15 @@ void PrintIdle(void) {
       int gsr_i = (int) hgsr;
       int meas_i = (int)meas;
       int bpm_i = (int) bpm;
-      sprintf(buf, (const far rom char*)"M%d P%3d G%3d ", (int)meas, (int)bpm, (int)gsr_i);
-      //sprintf(buf, "M%d P%3d G%3d", (int)meas, (int)bpm, (int)errcnt);
+      char c;
+
+      int u1 = nsim/1000;
+      int u2 = (nsim % 1000)/10;
+
+      if(timestamp.msec==0) c=' '; else c='*';
+      sprintf(buf, (const far rom char*)"M%d P%3d G%2d.%02d %c", (int)meas, (int)bpm, u1, u2, c);
+      //sprintf(buf, (const far rom char*)"%d %d %d ", gsr_i, vref, nsim); 
+      
    }
 
    // %d%% %d", bpm, (int) blev, b);
@@ -556,7 +580,7 @@ void PrintIdle(void) {
    XLCDPutRamString(buf);
 }
 
-void PrintInfo(char *buf) {
+void PrintInfo(const far ram char *buf) {
    XLCDClear();
    XLCDL1home();
    XLCDPutRamString(buf);
@@ -585,10 +609,26 @@ void ProcessLcd() {
    PrintIdle();      
 }
 
+void GetMemSize() {
+   char c;
+
+   WriteEEPROM(2*65536+10, 36);
+   ReadCharEEPROM(2*65536+10, &c);
+
+   if(c==36) {
+      memsize = 4*65536;
+      PrintInfoROM("2Mbit memory");
+      return;
+   }
+
+   else memsize = 2*65536;
+   PrintInfoROM("1Mbit memory");
+}
+
 void StoreDataType(unsigned char type, unsigned int value) {
    unsigned char *c = (unsigned char*) &value;
 
-   if(eeprom_addr>=2*65536) {
+   if(eeprom_addr>=memsize) {
       state=FULL;
       return;
    }
@@ -599,11 +639,27 @@ void StoreDataType(unsigned char type, unsigned int value) {
 }
 
 void StoreData(unsigned char type, unsigned int value) {
-   unsigned char *c = (unsigned char *)&eeprom_addr;
+   //unsigned char *c = (unsigned char *)&eeprom_addr;
+
+//return;
 
    if( (eeprom_addr & 0b00111111) == 0) {
       StoreDataType(T_MEAS, (unsigned int)meas);
-      //StoreDataType(T_DT, (unsigned int)conf.GSR_DT);
+
+      if(write_ts && timestamp.msec>0) {      
+         StoreDataType(T_TS, 0); 
+         WriteLongEEPROM(eeprom_addr, timestamp.ts[0]);
+         WriteLongEEPROM(eeprom_addr+4, timestamp.ts[1]);
+         eeprom_addr += 8;
+
+         WriteLongEEPROM(eeprom_addr, timestamp.msec);
+         eeprom_addr += 4;  
+
+         WriteLongEEPROM(eeprom_addr, msec);
+         eeprom_addr += 4;  
+
+         write_ts=0;
+      }
    }
    StoreDataType(type, value);
 }
@@ -626,10 +682,37 @@ void ProcessGsr(void) {
 
    // dt msec has elapsed
    if(msec >= last_msec + conf.GSR_DT) {
-      
+      float VREF = vref * 5.0 / 24.0;
+	  float U, I, S;
+	  
       hgsr = fgsr / gsr_n;
       fgsr=0;
       gsr_n=0;
+
+      U = (5.0-VREF) * hgsr / 1024.0;
+      I = (U) / 470000.0;
+      S = I / VREF;
+
+      nsim = S * 1e9;
+
+      if(hgsr<300 && msec - last_vrefchg > 500) {        
+         int old = vref;
+         vref+=2;
+         if(vref>15) vref=15;
+         CVRCON = 0b11100000 | vref;
+         if(state==REC && vref!=old) StoreData(T_REF, vref);
+         last_vrefchg = msec;
+      } 
+
+      if(hgsr>700 && msec - last_vrefchg > 500) {        
+         int old = vref;
+         vref-=2;
+         if(vref<1) vref=1;
+         CVRCON = 0b11100000 | vref;
+         if(state==REC && vref!=old) StoreData(T_REF, vref);
+         last_vrefchg = msec;
+      } 
+
 
       if(state==REC) {
          i = (unsigned int)(4.0*hgsr);
@@ -652,7 +735,7 @@ void InitMeas(void) {
 
    PrintInfoROM((const far rom char*)VERSION);
 
-   for(i=0; i<2*65536; i+=64) {
+   for(i=0; i<memsize; i+=64) {
       unsigned char c;
       int ret;
 
@@ -661,7 +744,7 @@ void InitMeas(void) {
       if(c==0) break;
    }
 
-   if(i>=2*65536) {
+   if(i>=memsize) {
       // full
       state = FULL;
       return;
@@ -698,7 +781,11 @@ void StartMeas(void) {
 
    state = REC;
 
-   PrintInfoROM("Starting");
+   PrintInfoROM((const far rom char*)"Starting");
+
+   write_ts=1;
+
+   StoreData(T_REF, vref);
 
    nmark=0;
    meas_start=msec;
@@ -718,7 +805,7 @@ void HardReset(void) {
    XLCDL1home();
    XLCDPutRomString((const far rom char*)"HARD RESET");
 
-   for(i=0; i<65536*2; i+=128) {
+   for(i=0; i<memsize; i+=128) {
       PageClearEEPROM(i);   
 
       if(i%100 == 0) {
@@ -736,26 +823,29 @@ void HardReset(void) {
 
 }
 
+#define SWON 0
+#define SWOFF 1
 
-
-// process switch button
-char longpress_processed = 0;
-char marker_processed = 0;
+// process button
+static char longpress_processed = 0;
+static char marker_processed = 0;
 void ProcessSw(void) {
    unsigned long dt=0;
 
-   if(sw==1) {
+   if(sw==SWOFF) {
       sw_on = 0;
       marker_processed = 0;
       longpress_processed = 0;
       return;
    }
+ 
+   // HERE SWITCH IS ON
 
    if(sw_on==0) sw_on = msec;
 
    dt = msec - sw_on;
 
-   if(dt>10 && state == IDLE && longpress_processed == 0) {
+   if(dt>50 && state == IDLE && longpress_processed == 0) {
 
       marker_processed = 1; // suppress marker processing
 
@@ -763,7 +853,7 @@ void ProcessSw(void) {
       return;
    }
 
-   if(dt>10 && marker_processed == 0 && state == REC) {
+   if(dt>50 && marker_processed == 0 && state == REC) {
 
       // USBDeviceDetach(); TEST: POWER
 
@@ -865,7 +955,7 @@ void ProcessPulse(void) {
 void main(void)
 {   
 
-    XLCDInit();  
+    while(!OSCCONbits.OSTS); 
     
     ADCON1 |= 0x0F;                 // Default all pins to digital
 
@@ -873,25 +963,15 @@ void main(void)
     tris_pulse_led=0; 
     pulse_led = 0;
 
+
     // SHUTDOWN USB
     // UCONbits.USBEN=0;
 
     INTCON2bits.RBPU = 0; // 0=enable pull ups on portB
 
     // voltage reference config
-    CVRCON = 0b11100011; //(lowest 4 bits: from 5V * D * 2/3)
+    CVRCON = 0b11100000 | vref; //(lowest 4 bits: from 5V * D / 24)
     //CVRCON = 0b11100111; //(lowest 4 bits: from ~ 0V to 3V)
-
-    // usb
-    InitializeSystem(); 
-
-    InitI2C();
-    mInitSwitch();
-
-    //eeprom_addr = ReadLongEEPROM(0);
-
-    //HardReset();
-
 
     #if defined(USE_SELF_POWER_SENSE_IO)
     tris_self_power = INPUT_PIN;	// See HardwareProfile.h
@@ -900,6 +980,22 @@ void main(void)
     #if defined(USE_USB_BUS_SENSE_IO)
     tris_usb_bus_sense = 1; // See HardwareProfile.h
     #endif
+
+
+    XLCDInit(); 
+
+    // usb
+    InitializeSystem(); 
+
+    InitI2C();
+    mInitSwitch();
+
+
+    GetMemSize();
+
+    //eeprom_addr = ReadLongEEPROM(0);
+
+    //HardReset();
 
 
 /*
@@ -926,6 +1022,11 @@ void main(void)
     T1CONbits.TMR1ON = 1; // enable interrupt
     PIE1bits.TMR1IE = 1; // enable interrupt
 
+    // timer resolution
+    dt = 1000.0 / 32768.0 * (65536-((float)dtimer*256));
+    dt-=1000.0*(128)/32768.0;
+
+
     // enable all interrupts
     RCONbits.IPEN=1;
     INTCONbits.GIEH=1;
@@ -933,7 +1034,8 @@ void main(void)
     TRISAbits.TRISA0=1; // GSR input pin
     TRISAbits.TRISA2=1; // Battery input pin
 
-    ADCON1=0b00101011; // select ports 0,1,2,3 as Analog
+    ADCON1=0b00001011; // select ports 0,1,2,3 as Analog
+
     ADCON2=0x3C;         // set A/D clock and A/D duration
     ADCON2bits.ADFM = 1; // A/D result right justified
 
@@ -942,20 +1044,23 @@ void main(void)
     eeprom_addr = 0;
     //gsr = 0;
 
-    //UpdateTime();
-
     InitMeas(); 
 
     USBDeviceAttach(); //////////////////// TEST
 
     bat = ReadBattery();
+
+
+//while(1) {
+//   PrintInfoROM("sss");
+//   Delay_ms(1000);
+//}
   
     while(1)
     {
 
 		// Application-specific tasks.
 		// Application related code may be added here, or in the ProcessIO() function.
-        //UpdateTime();
 
         ProcessIO();
 
@@ -970,14 +1075,15 @@ void main(void)
         }
 
         if(!USB_BUS_SENSE) {   
-           //USBDeviceDetach(); // may not need this?
-           OSCCONbits.IDLEN=0;
+         
+           //OSCCONbits.IDLEN=0;
            //TEST_LED = 0;
            Sleep();        
            //TEST_LED = 1;
-        } //else USBDeviceAttach();
+        } 
 
         //while(!OSCCONbits.OSTS);
+        
 
     }//end while
 }//end main
@@ -998,7 +1104,7 @@ static void InitializeSystem(void)
     USBOutHandle = 0;
     USBInHandle = 0;
 
-    blinkStatusValid = TRUE;
+    //blinkStatusValid = TRUE;
     
     USBDeviceInit();	//usb_device.c.  Initializes USB module SFRs and firmware
     					//variables to known states.
@@ -1016,10 +1122,10 @@ static void InitializeSystem(void)
 void ProcessIO(void)
 {   
     //Blink the LEDs according to the USB device status
-    if(blinkStatusValid)
-    {
-        BlinkUSBStatus();
-    }
+    //if(blinkStatusValid)
+    //{
+    //    BlinkUSBStatus();
+    //}
 
     // User Application USB tasks
     if((USBDeviceState < CONFIGURED_STATE)||(USBSuspendControl==1)) return;
@@ -1028,6 +1134,20 @@ void ProcessIO(void)
     {   
         switch(ReceivedDataBuffer[0])				//Look at the data the host sent, to see what kind of application specific command it sent.
         {
+            case 0x30:	//Read memory size
+                {
+	                while(HIDTxHandleBusy(USBInHandle));
+	                 
+					ToSendDataBuffer[0] = 0x30;  	//Echo back to the host the command we are fulfilling in the first byte.  In this case, the Read POT (analog voltage) command.
+
+                    if(memsize>2*65536) ToSendDataBuffer[1] = 2;
+                    else ToSendDataBuffer[1] = 1;
+
+	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
+                }
+                break;
+
+
             case 0x34:	//Set connected flag
                 {
 	                while(HIDTxHandleBusy(USBInHandle));
@@ -1069,7 +1189,8 @@ void ProcessIO(void)
 
 	                while(HIDTxHandleBusy(USBInHandle));
 	                
-                    i= ((int) (hgsr*16.0))/4;
+                    // i= ((int) (hgsr*16.0))/4;
+                    i=nsim;
                     c = (unsigned char*) &i;
  
 					ToSendDataBuffer[0] = 0x37;  	//Echo back to the host the command we are fulfilling in the first byte.  In this case, the Read POT (analog voltage) command.
@@ -1202,34 +1323,25 @@ void ProcessIO(void)
                 }
                 break;
 
-            case 0x51:	//Read config
+
+            case 0x60:	//set sync
                 {
                     unsigned char *c;
+                    Timestamp ts;
 
 	                while(HIDTxHandleBusy(USBInHandle));
-
-                    c = (unsigned char*) &msec;
  
-					ToSendDataBuffer[0] = 0x51;  	//Echo back
+					ToSendDataBuffer[0] = 0x60;  	//Echo back
                     
-					memcpy((void far *)(ToSendDataBuffer+1), (const void far *)&conf, sizeof(conf));
-					
+					memcpy((void far *)&ts, (const void far *)(ReceivedDataBuffer+1), sizeof(ts));
 
-	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
-                }
-                break;
+                    timestamp= ts;
+                    //timestamp.ts[1] = ts.ts[1];
+                    timestamp.msec = msec;
 
-            case 0x52:	//Save config
-                {
-                    unsigned char *c;
+                    write_ts=1;
 
-	                while(HIDTxHandleBusy(USBInHandle));
-
-                    c = (unsigned char*) &msec;
- 
-					ToSendDataBuffer[0] = 0x51;  	//Echo back
-                    
-					memcpy((void far *)&conf, (const void far *)(ReceivedDataBuffer+1), sizeof(conf));
+                    //PrintInfoROM("TS");
 					
 	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
                 }

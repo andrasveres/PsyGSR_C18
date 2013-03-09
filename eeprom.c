@@ -1,6 +1,7 @@
 #include "eeprom.h"
-#include <i2c.h>
-#include "i2c_extras.h"
+//#include <i2c.h>
+//#include "i2c_extras.h"
+//#include <p18f4550.h>
 #include <sw_i2c.h>
 
 void WriteLongEEPROM(unsigned long addr, unsigned long i) {
@@ -76,7 +77,8 @@ int WriteEEPROM(unsigned long addr, unsigned char data) {
     unsigned char HighAdd, LowAdd;
     int ret=0;
 
-    if(addr>65535) ControlByte = ControlByte | 0x08; // block select for addresses over 512kbit
+    if(addr | 0x00010000) ControlByte = ControlByte | 0x08; // A16 address bit
+    if(addr > 2*65536) ControlByte = ControlByte | 0x02; // Chip select set for second chip
 
     HighAdd = (addr & 0x0000ff00) >> 8;
     LowAdd = addr & 0x000000ff;   
@@ -112,14 +114,12 @@ int WriteEEPROM(unsigned long addr, unsigned char data) {
     }
     if(SWAckI2C()) ret=-8;
 
+    SWStopI2C();
+    ack_poll(ControlByte);
+    return ret;
+
  stop:
     SWStopI2C();
- 
-    // ack poll
-    ack_poll(ControlByte);
-
-    // HDByteWriteI2C(ControlByte, HighAdd, LowAdd, data );
-
     return ret;
 
 }
@@ -129,7 +129,8 @@ int ReadEEPROM(unsigned long addr, unsigned char *data, unsigned char length) {
     unsigned char HighAdd, LowAdd;
     int ret=0;
 
-    if(addr>65535) ControlByte = ControlByte | 0x08; // block select for addresses over 512kbit
+    if(addr | 0x00010000) ControlByte = ControlByte | 0x08; // A16 address bit
+    if(addr > 2*65536) ControlByte = ControlByte | 0x02; // Chip select set for second chip
 
     HighAdd = (addr & 0x0000ff00) >> 8;
     LowAdd = addr & 0x000000ff;       
