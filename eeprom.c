@@ -77,8 +77,10 @@ int WriteEEPROM(unsigned long addr, unsigned char data) {
     unsigned char HighAdd, LowAdd;
     int ret=0;
 
-    if(addr | 0x00010000) ControlByte = ControlByte | 0x08; // A16 address bit
-    if(addr > 2*65536) ControlByte = ControlByte | 0x02; // Chip select set for second chip
+    unsigned char *c = &addr;
+    unsigned char hh = c[2];
+    if(hh & 1) ControlByte = ControlByte | 0x08; // A16 address bit
+    if(hh & 2) ControlByte = ControlByte | 0x02; // Chip select set for second chip
 
     HighAdd = (addr & 0x0000ff00) >> 8;
     LowAdd = addr & 0x000000ff;   
@@ -129,8 +131,13 @@ int ReadEEPROM(unsigned long addr, unsigned char *data, unsigned char length) {
     unsigned char HighAdd, LowAdd;
     int ret=0;
 
-    if(addr | 0x00010000) ControlByte = ControlByte | 0x08; // A16 address bit
-    if(addr > 2*65536) ControlByte = ControlByte | 0x02; // Chip select set for second chip
+    unsigned char *c = &addr;
+    unsigned char hh = c[2];
+
+    //if(addr>65535) ControlByte = ControlByte | 0x08;
+
+    if(hh & 1) ControlByte = ControlByte | 0x08; // A16 address bit
+    if(hh & 2) ControlByte = ControlByte | 0x02; // Chip select set for second chip
 
     HighAdd = (addr & 0x0000ff00) >> 8;
     LowAdd = addr & 0x000000ff;       
@@ -191,7 +198,12 @@ void PageWriteEEPROM(unsigned long addr, unsigned char *data, unsigned char leng
     unsigned char HighAdd, LowAdd;
     int i;
 
-    if(addr>65535) ControlByte = ControlByte | 0x08; // block select for addresses over 512kbit
+    unsigned char *c = &addr;
+    unsigned char hh = c[2];
+
+    if(hh & 1) ControlByte = ControlByte | 0x08; // A16 address bit
+    if(hh & 2) ControlByte = ControlByte | 0x02; // Chip select set for second chip
+
 
     HighAdd = (addr & 0x0000ff00) >> 8;
     LowAdd = addr & 0x000000ff;   
@@ -219,7 +231,12 @@ void PageClearEEPROM(unsigned long addr) {
     unsigned char HighAdd, LowAdd;
     int i;
 
-    if(addr>65535) ControlByte = ControlByte | 0x08; // block select for addresses over 512kbit
+    unsigned char *c = &addr;
+    unsigned char hh = c[2];
+
+    if(hh & 1) ControlByte = ControlByte | 0x08; // A16 address bit
+    if(hh & 2) ControlByte = ControlByte | 0x02; // Chip select set for second chip
+
 
     HighAdd = (addr & 0x0000ff00) >> 8;
     LowAdd = addr & 0x000000ff;   

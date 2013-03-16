@@ -1,8 +1,4 @@
 
-// Ez a kod a PIC18F4550-re mukodik GSR katyaval grafikus LCD
-// RTC-t kivettem belole az egyszeruseg kedveert ezert kell neki egy 32.768 kristaly
-// az aramot is 7805-tel kapja 9v-rol
-// 
 
 // Szukseges: MPLAB IDE v8.83
 //            Nem biztos: Microchip Solutions v2011-12-05 (innen jon az USB)
@@ -18,10 +14,8 @@
 #include "./USB/usb.h"
 #include "HardwareProfile.h"
 #include "./USB/usb_function_hid.h"
-//#include "font.h"
 #include "eeprom.h"
 #include <delays.h>
-//#include <string.h>
 
 //Andris includes
 //#include <i2c.h>
@@ -76,7 +70,7 @@
 
 #pragma romdata
 
-const far rom char *VERSION = "PsyGSR 0.2.1d";
+const far rom char *VERSION = "PsyGSR 0.2.1e";
 
 
 /** VARIABLES ******************************************************/
@@ -174,13 +168,12 @@ typedef struct Config {
 Config conf = {250, 1, 5000};
 
 typedef struct Timestamp {
-   unsigned long ts[2]; // unix timestamp * 1000 (8 bytes)
+   unsigned long ts[2]; // unix timestamp in msec (8 bytes)
    unsigned long msec;  // local time
 } Timestamp;
 
 Timestamp timestamp = {0 ,0};
 
-char write_ts=0;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -349,6 +342,9 @@ void InitI2C(void)
 
 return; // EZ EDDIG NEM VOLT KOMMENTELVE
 
+// WE only need below code if we use the hw i2c library
+// for now we use the sw library --> probable hw lib would be better
+
 //OpenI2C(MASTER, SLEW_ON);
 //SSPADD=0x09;
 //return;
@@ -505,6 +501,10 @@ void PrintRec(void) {
    
    char c;
 
+   int u1 = nsim/1000;
+   int u2 = (nsim % 1000)/10;
+
+
    min = s / 60;
    sec = s - min * 60;
    sprintf(buf, (const far rom char*)"T=%2d:%02d M%d H%d ", (int)min, (int)sec, (int)meas_i, (int)nmark_i);
@@ -513,8 +513,9 @@ void PrintRec(void) {
    XLCDL1home();
    XLCDPutRamString(buf);
 
+
    if(timestamp.msec==0) c=' '; else c='*';
-   sprintf(buf, (const far rom char*)"P=%3d G=%3d %c", bpm_i, gsr_i, c);
+   sprintf(buf, (const far rom char*)"P%3d G%2d.%02d %c", bpm_i, u1, u2, c);
    //sprintf(buf, (const far rom char*)"%lu %d", eeprom_addr, errcnt);
 
    // %d%% %d", bpm, (int) blev, b);
@@ -645,21 +646,6 @@ void StoreData(unsigned char type, unsigned int value) {
 
    if( (eeprom_addr & 0b00111111) == 0) {
       StoreDataType(T_MEAS, (unsigned int)meas);
-
-      if(write_ts && timestamp.msec>0) {      
-         StoreDataType(T_TS, 0); 
-         WriteLongEEPROM(eeprom_addr, timestamp.ts[0]);
-         WriteLongEEPROM(eeprom_addr+4, timestamp.ts[1]);
-         eeprom_addr += 8;
-
-         WriteLongEEPROM(eeprom_addr, timestamp.msec);
-         eeprom_addr += 4;  
-
-         WriteLongEEPROM(eeprom_addr, msec);
-         eeprom_addr += 4;  
-
-         write_ts=0;
-      }
    }
    StoreDataType(type, value);
 }
@@ -783,9 +769,20 @@ void StartMeas(void) {
 
    PrintInfoROM((const far rom char*)"Starting");
 
-   write_ts=1;
-
    StoreData(T_REF, vref);
+
+   // WRITE TIMESTAMP
+
+   StoreData(T_TS, 0); 
+   WriteLongEEPROM(eeprom_addr, timestamp.ts[0]);
+   WriteLongEEPROM(eeprom_addr+4, timestamp.ts[1]);
+   eeprom_addr += 8;
+
+   WriteLongEEPROM(eeprom_addr, timestamp.msec);
+   eeprom_addr += 4;  
+
+   WriteLongEEPROM(eeprom_addr, msec);
+   eeprom_addr += 4;  
 
    nmark=0;
    meas_start=msec;
@@ -1050,6 +1047,17 @@ void main(void)
 
     bat = ReadBattery();
 
+/*
+{
+    char buf[20];
+    unsigned long addr = 65536+4096;
+    unsigned char *c = &addr;
+    unsigned char hh = c[2];
+    sprintf(buf, "%d", (hh|1));
+    PrintInfo(buf);
+while(1);
+}
+*/
 
 //while(1) {
 //   PrintInfoROM("sss");
@@ -1338,14 +1346,88 @@ void ProcessIO(void)
                     timestamp= ts;
                     //timestamp.ts[1] = ts.ts[1];
                     timestamp.msec = msec;
-
-                    write_ts=1;
-
+                    
                     //PrintInfoROM("TS");
 					
 	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
                 }
                 break;
+
+            case 0x61:	//get sync
+                {
+
+	                while(HIDTxHandleBusy(USBInHandle));
+ 
+					ToSendDataBuffer[0] = 0x61;  	//Echo back
+                    
+					memcpy((const void far *)ToSendDataBuffer+1 , (const void far *)(&timestamp), sizeof(timestamp));
+                    memcpy((const void far *)ToSendDataBuffer+1+sizeof(timestamp) , (const void far *)(&msec), sizeof(msec));
+                    
+                    //PrintInfoROM("TS");
+					
+	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
+                }
+                break;
+
+            case 0x62:	//set marker
+                {
+
+	                while(HIDTxHandleBusy(USBInHandle));
+ 
+					ToSendDataBuffer[0] = 0x62;  	//Echo back
+
+                    if(state==REC) {
+                       nmark++;
+                       StoreData(T_MARK, (unsigned int)nmark);
+                    }
+                    
+                    //PrintInfoROM("TS");
+					
+	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
+                }
+                break;
+
+
+            case 0x63:	//start meas
+                {
+
+	                while(HIDTxHandleBusy(USBInHandle));
+ 
+					ToSendDataBuffer[0] = 0x63;  	//Echo back
+
+                    StartMeas();
+                    
+                    //PrintInfoROM("TS");
+					
+	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
+                }
+                break;
+
+
+
+            case 0x70:	// Write char to EEPROM
+                {
+                    long addr = 0;
+                    long b0 = ReceivedDataBuffer[1];
+                    long b1 = ReceivedDataBuffer[2];
+                    long b2 = ReceivedDataBuffer[3];
+                    long b3 = ReceivedDataBuffer[4];
+                    unsigned char c;
+
+                    addr = b0 + (b1<<8) + (b2<<16) + (b3<<24);
+
+                    c = ReceivedDataBuffer[5];
+
+                    WriteEEPROM(addr, c);
+
+	                while(HIDTxHandleBusy(USBInHandle)) ;
+	                 
+					ToSendDataBuffer[0] = 0x70;
+
+	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
+                }
+                break;
+
 
         }
         //Re-arm the OUT endpoint for the next packet
