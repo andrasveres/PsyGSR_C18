@@ -57,12 +57,12 @@
     //and USE_USB_BUS_SENSE_IO features.  Uncomment the below line(s) if
     //it is desireable to use one or both of the features.
     //#define USE_SELF_POWER_SENSE_IO
-    #define tris_self_power     TRISAbits.TRISA2    // Input
-    #if defined(USE_SELF_POWER_SENSE_IO)
-    #define self_power          PORTAbits.RA2
-    #else
+    //#define tris_self_power     TRISAbits.TRISA2    // Input
+    //#if defined(USE_SELF_POWER_SENSE_IO)
+    //#define self_power          PORTAbits.RA2
+    //#else
     #define self_power          1
-    #endif
+    //#endif
 
     ///////////////////////////////////// ANDRIS *******
     #define USE_USB_BUS_SENSE_IO 

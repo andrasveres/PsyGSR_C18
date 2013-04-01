@@ -16,6 +16,7 @@
 #include "./USB/usb_function_hid.h"
 #include "eeprom.h"
 #include <delays.h>
+#include "pic_eeprom.h"
 
 //Andris includes
 //#include <i2c.h>
@@ -41,7 +42,7 @@
         #pragma config WDT      = OFF
         #pragma config WDTPS    = 32768
         #pragma config MCLRE    = ON
-        #pragma config LPT1OSC  = ON   // KULONBEN NAGYON GYORSAN FUTOTT, EZ EGY HACK
+        #pragma config LPT1OSC  = ON   // OFF = Timer 1 high power mode, ON = Low power mode
         #pragma config PBADEN   = OFF
 //      #pragma config CCP2MX   = ON
         #pragma config STVREN   = ON  // stack under/overflow causes reset
@@ -70,7 +71,7 @@
 
 #pragma romdata
 
-const far rom char *VERSION = "PsyGSR 0.2.1e";
+const far rom char *VERSION = "PsyGSR 0.2.1f";
 
 
 /** VARIABLES ******************************************************/
@@ -99,7 +100,7 @@ unsigned far char ToSendDataBuffer[USBSIZE];
 #define T_BAT   0b01100000
 #define T_BPM   0b10000000
 #define T_PP    0b10100000
-#define T_TS    0b11000000
+#define T_HLVD  0b11000000
 #define T_REF   0b11100000  // voltage reference
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -108,9 +109,11 @@ unsigned far char ToSendDataBuffer[USBSIZE];
 #pragma udata
 
 unsigned char vref = 3;
-unsigned long last_vrefchg = 0;  // last time vref was changed
+//unsigned long last_vrefchg = 0;  // last time vref was changed
 
 unsigned long msec=0;
+volatile unsigned long tick = 0;
+
 float fmsec=0;
 
 unsigned long last_msec=0;
@@ -175,6 +178,19 @@ typedef struct Timestamp {
 Timestamp timestamp = {0 ,0};
 
 
+static double dt=0;
+volatile int intf=0;
+volatile unsigned char dtimer = 0b11111111; // ~7.5ms 
+volatile unsigned char dtimerl = 256-128; //128; // substr. approx 4ms
+volatile unsigned char n_inth = 0;
+volatile unsigned char n_inth_nontmr1 = 0;
+volatile unsigned char n_intl = 0;
+volatile unsigned char tmr = 0;
+
+unsigned int hlvd=0;
+
+unsigned char name[16];
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -190,95 +206,29 @@ void ProcessIO(void);
 void YourHighPriorityISRCode();
 void YourLowPriorityISRCode();
 void USBCBSendResume(void);
-WORD_VAL ReadPOT(void);
+
 
 /** VECTOR REMAPPING ***********************************************/
 #if defined(__18CXX)
-	//On PIC18 devices, addresses 0x00, 0x08, and 0x18 are used for
-	//the reset, high priority interrupt, and low priority interrupt
-	//vectors.  However, the current Microchip USB bootloader 
-	//examples are intended to occupy addresses 0x00-0x7FF or
-	//0x00-0xFFF depending on which bootloader is used.  Therefore,
-	//the bootloader code remaps these vectors to new locations
-	//as indicated below.  This remapping is only necessary if you
-	//wish to program the hex file generated from this project with
-	//the USB bootloader.  If no bootloader is used, edit the
-	//usb_config.h file and comment out the following defines:
-	//#define PROGRAMMABLE_WITH_USB_HID_BOOTLOADER
-	//#define PROGRAMMABLE_WITH_USB_LEGACY_CUSTOM_CLASS_BOOTLOADER
-	
-	#if defined(PROGRAMMABLE_WITH_USB_HID_BOOTLOADER)
-		#define REMAPPED_RESET_VECTOR_ADDRESS			0x1000
-		#define REMAPPED_HIGH_INTERRUPT_VECTOR_ADDRESS	0x1008
-		#define REMAPPED_LOW_INTERRUPT_VECTOR_ADDRESS	0x1018
-	#elif defined(PROGRAMMABLE_WITH_USB_MCHPUSB_BOOTLOADER)	
-		#define REMAPPED_RESET_VECTOR_ADDRESS			0x800
-		#define REMAPPED_HIGH_INTERRUPT_VECTOR_ADDRESS	0x808
-		#define REMAPPED_LOW_INTERRUPT_VECTOR_ADDRESS	0x818
-	#else	
-		#define REMAPPED_RESET_VECTOR_ADDRESS			0x00
-		#define REMAPPED_HIGH_INTERRUPT_VECTOR_ADDRESS	0x08
-		#define REMAPPED_LOW_INTERRUPT_VECTOR_ADDRESS	0x18
-	#endif
-	
-	#if defined(PROGRAMMABLE_WITH_USB_HID_BOOTLOADER)||defined(PROGRAMMABLE_WITH_USB_MCHPUSB_BOOTLOADER)
-	extern void _startup (void);        // See c018i.c in your C18 compiler dir
-	#pragma code REMAPPED_RESET_VECTOR = REMAPPED_RESET_VECTOR_ADDRESS
-	void _reset (void)
-	{
-	    _asm goto _startup _endasm
-	}
-	#endif
-	#pragma code REMAPPED_HIGH_INTERRUPT_VECTOR = REMAPPED_HIGH_INTERRUPT_VECTOR_ADDRESS
-	void Remapped_High_ISR (void)
-	{
-	     _asm goto YourHighPriorityISRCode _endasm
-	}
-	#pragma code REMAPPED_LOW_INTERRUPT_VECTOR = REMAPPED_LOW_INTERRUPT_VECTOR_ADDRESS
-	void Remapped_Low_ISR (void)
-	{
-	     _asm goto YourLowPriorityISRCode _endasm
-	}
-	
-	#if defined(PROGRAMMABLE_WITH_USB_HID_BOOTLOADER)||defined(PROGRAMMABLE_WITH_USB_MCHPUSB_BOOTLOADER)
-	//Note: If this project is built while one of the bootloaders has
-	//been defined, but then the output hex file is not programmed with
-	//the bootloader, addresses 0x08 and 0x18 would end up programmed with 0xFFFF.
-	//As a result, if an actual interrupt was enabled and occured, the PC would jump
-	//to 0x08 (or 0x18) and would begin executing "0xFFFF" (unprogrammed space).  This
-	//executes as nop instructions, but the PC would eventually reach the REMAPPED_RESET_VECTOR_ADDRESS
-	//(0x1000 or 0x800, depending upon bootloader), and would execute the "goto _startup".  This
-	//would effective reset the application.
-	
-	//To fix this situation, we should always deliberately place a 
-	//"goto REMAPPED_HIGH_INTERRUPT_VECTOR_ADDRESS" at address 0x08, and a
-	//"goto REMAPPED_LOW_INTERRUPT_VECTOR_ADDRESS" at address 0x18.  When the output
-	//hex file of this project is programmed with the bootloader, these sections do not
-	//get bootloaded (as they overlap the bootloader space).  If the output hex file is not
-	//programmed using the bootloader, then the below goto instructions do get programmed,
-	//and the hex file still works like normal.  The below section is only required to fix this
-	//scenario.
-	#pragma code HIGH_INTERRUPT_VECTOR = 0x08
-	void High_ISR (void)
-	{
-	     _asm goto REMAPPED_HIGH_INTERRUPT_VECTOR_ADDRESS _endasm
-	}
-	#pragma code LOW_INTERRUPT_VECTOR = 0x18
-	void Low_ISR (void)
-	{
-	     _asm goto REMAPPED_LOW_INTERRUPT_VECTOR_ADDRESS _endasm
-	}
-	#endif	//end of "#if defined(PROGRAMMABLE_WITH_USB_HID_BOOTLOADER)||defined(PROGRAMMABLE_WITH_USB_LEGACY_CUSTOM_CLASS_BOOTLOADER)"
 
-	#pragma code
+
+   #pragma code HIGH_INTERRUPT_VECTOR = 0x08
+    void High_ISR_Vector (void)
+    {
+        _asm goto YourHighPriorityISRCode _endasm
+    }
+    #pragma code LOW_INTERRUPT_VECTOR = 0x18
+    void Low_ISR_Vector (void)
+    {
+        _asm goto YourLowPriorityISRCode _endasm
+    }
+
+	//#pragma code
 	
 	
 	//These are your actual interrupt handling routines.
 	#pragma interrupt YourHighPriorityISRCode
-    static float dt=0;
-    int intf=0;
-    const unsigned char dtimer = 0b11111111; // ~7.5ms 
-    const unsigned char dtimerl = 128; // substr. approx 4ms
+
 	void YourHighPriorityISRCode()
 	{
 
@@ -289,17 +239,32 @@ WORD_VAL ReadPOT(void);
            //const unsigned char dtimer = 0b11111110; // ~15ms 
 
 
-           //n_inth++;
+           n_inth++;
            intf=1;
-           
+          
            while((TMR1L&0x01));
            while(!(TMR1L&0x01));
 
-           TMR1L+=dtimerl;
+           // After sleep, it may take too much time to get here (reach clock stability)
+           // There may be too little time left for the next interrupt in that case
+           // let's skip the next interrupt and go directly to the second
+
+           //if(TMR1L>255-dtimerl) {
+           //   TMR1L += dtimerl;
+           //   tmr++;
+           //   tick++;
+           //}
+           //if(T1CONbits.T1RUN) tmr++;
+
+           if(TMR1L!=1) tmr=TMR1L;
+
            TMR1H = dtimer; 
+           TMR1L +=dtimerl;
            
-           fmsec += dt;
-           msec = (unsigned long)fmsec;
+ 
+           //tmr = TMR1L;         
+
+           tick ++;
 
            PIR1bits.TMR1IF = 0;
 
@@ -308,19 +273,24 @@ WORD_VAL ReadPOT(void);
    		   //Check which interrupt flag caused the interrupt.
 		   //Service the interrupt
 		   //Clear the interrupt flag
-       }
+       } else {
        
-       //if(!USB_BUS_SENSE) USBDeviceDetach();
+          n_inth_nontmr1++;
+          //if(!USB_BUS_SENSE) USBDeviceDetach();
 
-       //#if defined(USB_INTERRUPT)
-       USBDeviceTasks();
-       //#endif
+          //#if defined(USB_INTERRUPT)
+          // USBDeviceTasks();
+          //#endif
+       }
       
 	}	//This return will be a "retfie fast", since this is in a #pragma interrupt section 
 	#pragma interruptlow YourLowPriorityISRCode
 	void YourLowPriorityISRCode()
 	{
-        //n_intl++;
+        n_intl++;
+
+        // USBDeviceTasks(); 
+
         //INTCONbits.TMR0IF = 0;
         //PIR1bits.TMR1IF = 0;
 
@@ -340,14 +310,14 @@ WORD_VAL ReadPOT(void);
 void InitI2C(void)
 {
 
-return; // EZ EDDIG NEM VOLT KOMMENTELVE
+   return; 
 
-// WE only need below code if we use the hw i2c library
-// for now we use the sw library --> probable hw lib would be better
+   // WE only need below code if we use the hw i2c library
+   // for now we use the sw library --> probable hw lib would be better
 
-//OpenI2C(MASTER, SLEW_ON);
-//SSPADD=0x09;
-//return;
+   //OpenI2C(MASTER, SLEW_ON);
+   //SSPADD=0x09;
+   
 
   // SSPADD=(FOSC/(4*100 kHz))-1. 
 
@@ -414,15 +384,26 @@ void XLCDDelay(void)
 }
 
 
+void ReadName() {
+   unsigned char i;
+   for(i=0; i<16; i++) name[i] = ReadPicEEPROM(i); 
+   name[15]=0;
+}
+
+void WriteName() {
+   unsigned char i;
+   for(i=0; i<16; i++) WritePicEEPROM(i, name[i]);
+}
+
 void ProcessLcd();
 
 
 unsigned int ReadBattery(void) {
     unsigned long i;
 
-    TRISAbits.TRISA0=1;
     ADCON0=0b00001101;  // AN3
-    ADCON2=0x3C;
+
+    ADCON2 = 0b10111110;
     ADCON2bits.ADFM = 1;
 
     ADCON1bits.VCFG1 = 0; // set voltage reference as negative baseline
@@ -441,7 +422,6 @@ unsigned int ReadBattery(void) {
 unsigned int ReadGsr(void) {
     unsigned int i;
 
-    TRISAbits.TRISA0=1;
     ADCON0=0x01;   // AN0
 
     ADCON2 = 0b10111110;
@@ -463,11 +443,12 @@ unsigned int ReadGsr(void) {
 unsigned int ReadPulse(void) {
     unsigned int i;
 
-    TRISAbits.TRISA1=1;
     ADCON0=0b00000101; // AN1
 
     ADCON2 = 0b10111110;
     ADCON2bits.ADFM = 1;
+
+    ADCON1bits.VCFG1 = 0; // set voltage reference as negative baseline
 
     Delay_us(10);
 
@@ -507,7 +488,7 @@ void PrintRec(void) {
 
    min = s / 60;
    sec = s - min * 60;
-   sprintf(buf, (const far rom char*)"T=%2d:%02d M%d H%d ", (int)min, (int)sec, (int)meas_i, (int)nmark_i);
+   sprintf(buf, (const far rom char*)"T%2d:%02d M%2d H%2d ", (int)min, (int)sec, (int)meas_i, (int)nmark_i);
    //sprintf(buf, "%lu  ", eeprom_addr);
 
    XLCDL1home();
@@ -546,7 +527,7 @@ void PrintIdle(void) {
    blev = bat;
    blev = 5.0*blev/1024.0;
 
-   blev = (blev-1.5) / (2.4-1.5) * 100.0;
+   blev = (blev-2.1) / (2.4-2.1) * 100.0;
 
    bb = (int)(blev);
    if(bb<0) bb = 0;
@@ -571,9 +552,9 @@ void PrintIdle(void) {
       int u2 = (nsim % 1000)/10;
 
       if(timestamp.msec==0) c=' '; else c='*';
-      sprintf(buf, (const far rom char*)"M%d P%3d G%2d.%02d %c", (int)meas, (int)bpm, u1, u2, c);
-      //sprintf(buf, (const far rom char*)"%d %d %d ", gsr_i, vref, nsim); 
-      
+      sprintf(buf, (const far rom char*)"M%2d P%3d G%2d.%02d%c", (int)meas, (int)bpm, u1, u2, c);
+      //sprintf(buf, (const far rom char*)"%lu %lu %lu", n_inth, n_intl, n_inth_nontmr1); 
+      //sprintf(buf, (const far rom char*)"%u  ", hlvd); 
    }
 
    // %d%% %d", bpm, (int) blev, b);
@@ -589,17 +570,27 @@ void PrintInfo(const far ram char *buf) {
    XLCDClear();
 }
 
-void PrintInfoROM(const far rom char *buf) {
+void PrintInfoROMRAM(const far rom char *buf, const far ram char *buf2) {
    XLCDClear();
    XLCDL1home();
    XLCDPutRomString(buf);
+   
+   if(buf2!=0) {
+      XLCDL2home();
+      XLCDPutRamString(buf2);
+   }
+
    Delay_ms(1000);
    XLCDClear();
 }
 
+void PrintInfoROM(const far rom char *buf) {
+   PrintInfoROMRAM(buf, 0);
+}
+
 void ProcessLcd() {
 
-   if(msec - last_lcd < 200) return;
+   if(msec - last_lcd < 500) return;
    last_lcd = msec;
 
    if(state==REC) {
@@ -651,11 +642,25 @@ void StoreData(unsigned char type, unsigned int value) {
 }
 
 void ProcessBat(void) {
-   int dt = 20000;
+   int dt = 5000;
+
+   if(PIR2bits.HLVDIF) {
+      hlvd++;
+      PIR2bits.HLVDIF=0;
+   }
+
    if(msec >= last_bat + dt) {
       bat = ReadBattery();
       last_bat = msec;
-      if(state==REC) StoreData(T_BAT, bat);
+      if(state==REC) {
+         StoreData(T_BAT, bat);
+         if(hlvd>0) {
+            StoreData(T_HLVD, hlvd);
+         }
+      }
+
+      hlvd=0;
+        
    }
 }
 
@@ -675,35 +680,34 @@ void ProcessGsr(void) {
       fgsr=0;
       gsr_n=0;
 
+      if(state==REC) {
+         i = (unsigned int)(4.0*hgsr);
+         StoreData(T_GSR, i);
+      }
+
       U = (5.0-VREF) * hgsr / 1024.0;
       I = (U) / 470000.0;
       S = I / VREF;
 
       nsim = S * 1e9;
 
-      if(hgsr<300 && msec - last_vrefchg > 500) {        
+      if(hgsr<300) { // && msec - last_vrefchg > 500) {        
          int old = vref;
-         vref+=2;
+         vref++;
          if(vref>15) vref=15;
          CVRCON = 0b11100000 | vref;
          if(state==REC && vref!=old) StoreData(T_REF, vref);
-         last_vrefchg = msec;
+         //last_vrefchg = msec;
       } 
 
-      if(hgsr>700 && msec - last_vrefchg > 500) {        
+      if(hgsr>700) { // && msec - last_vrefchg > 500) {        
          int old = vref;
-         vref-=2;
+         vref--;
          if(vref<1) vref=1;
          CVRCON = 0b11100000 | vref;
          if(state==REC && vref!=old) StoreData(T_REF, vref);
-         last_vrefchg = msec;
+         //last_vrefchg = msec;
       } 
-
-
-      if(state==REC) {
-         i = (unsigned int)(4.0*hgsr);
-         StoreData(T_GSR, i);
-      }
 
       last_msec += conf.GSR_DT; 
    }
@@ -719,7 +723,7 @@ void InitMeas(void) {
    
    state = IDLE;
 
-   PrintInfoROM((const far rom char*)VERSION);
+   PrintInfoROMRAM((const far rom char*)VERSION, name+1);
 
    for(i=0; i<memsize; i+=64) {
       unsigned char c;
@@ -769,11 +773,10 @@ void StartMeas(void) {
 
    PrintInfoROM((const far rom char*)"Starting");
 
-   StoreData(T_REF, vref);
+   StoreDataType(T_MEAS, (unsigned int)meas);
 
-   // WRITE TIMESTAMP
+   // WRITE TIMESTAMP BLOCK
 
-   StoreData(T_TS, 0); 
    WriteLongEEPROM(eeprom_addr, timestamp.ts[0]);
    WriteLongEEPROM(eeprom_addr+4, timestamp.ts[1]);
    eeprom_addr += 8;
@@ -783,6 +786,10 @@ void StartMeas(void) {
 
    WriteLongEEPROM(eeprom_addr, msec);
    eeprom_addr += 4;  
+
+   // TIMESTAMP BLOCK END
+
+   StoreData(T_REF, vref);
 
    nmark=0;
    meas_start=msec;
@@ -812,12 +819,11 @@ void HardReset(void) {
       }
    }
 
-   XLCDL1home();
-   sprintf( buf, (const far rom char*)"OK");
-   XLCDPutRamString(buf);
-   
+  
    InitMeas();
 
+   //XLCDPutRomString((const far rom char*)"INIT ");
+   //Delay_ms(1000);
 }
 
 #define SWON 0
@@ -884,7 +890,7 @@ void ProcessPulse(void) {
 
         p = ReadPulse();
         avg_pulse = 0.99 * avg_pulse + 0.01 * p;
-        avg_pulse_fast = 0.2 * avg_pulse + 0.8 * p;
+        avg_pulse_fast = p; //0.1 * avg_pulse_fast + 0.9 * p;
 
         if(p>max_pulse) max_pulse = p;
 
@@ -894,7 +900,7 @@ void ProcessPulse(void) {
            max_pulse = 0;
            pulse_led=0;
 
-        } else if(beat_detected==0 && p > avg_pulse && max_pulse > 250) {
+        } else if(beat_detected==0 && p > avg_pulse + 100 && max_pulse > 100) {
            int dt = msec - last_beat_calc;
            int sum = 0;
            int n=0;
@@ -920,7 +926,10 @@ void ProcessPulse(void) {
            }
 
            // if at least 5 beats available, calculate bpm
-           if(n>5) bpm = (int) (1.0 * n * 60000.0 / sum);
+           if(n>5) {
+              bpm = (int) (1.0 * n * 60000.0 / sum);
+              if(bpm>200) bpm=0;
+           }
 
            pulse_vec_ptr++;
            if(pulse_vec_ptr>=10) pulse_vec_ptr = 0;
@@ -978,11 +987,11 @@ void main(void)
     tris_usb_bus_sense = 1; // See HardwareProfile.h
     #endif
 
-
     XLCDInit(); 
 
     // usb
     InitializeSystem(); 
+
 
     InitI2C();
     mInitSwitch();
@@ -1014,32 +1023,62 @@ void main(void)
     T1CONbits.RD16 =0; // 1=16 bit counter enabled
     T1CONbits.T1SYNC =1; // 1=switch off sync mode
     PIR1bits.TMR1IF = 0; // clear timer flag
-    TMR1H = 0b11110000; // preset to 125msec
+    TMR1H = dtimer; // preload 
     TMR1L = 0;
     T1CONbits.TMR1ON = 1; // enable interrupt
     PIE1bits.TMR1IE = 1; // enable interrupt
 
     // timer resolution
-    dt = 1000.0 / 32768.0 * (65536-((float)dtimer*256));
-    dt-=1000.0*(128)/32768.0;
-
+    dt = 1000.0 / 32768.0 * (65536-(dtimer*256.0));
+    dt-=1000.0*(dtimerl)/32768.0;
+    //dt*=8; // prescaler
 
     // enable all interrupts
-    RCONbits.IPEN=1;
-    INTCONbits.GIEH=1;
+    //RCONbits.IPEN=1;     // Interrupt priorities enabled
+    INTCONbits.GIEH=1;   // Enable high priority interrupts
+    INTCONbits.GIEL = 1; // Enable low priority interrupts
+    IPR2bits.USBIP = 0;  // USB uses low prio interrupts
+    IPR1bits.TMR1IP = 1; // 32k timer uses hig prio interrupts
 
     TRISAbits.TRISA0=1; // GSR input pin
-    TRISAbits.TRISA2=1; // Battery input pin
+    TRISAbits.TRISA1=1; // pulse input pin
+    TRISAbits.TRISA3=1; // Battery input pin
 
     ADCON1=0b00001011; // select ports 0,1,2,3 as Analog
 
     ADCON2=0x3C;         // set A/D clock and A/D duration
     ADCON2bits.ADFM = 1; // A/D result right justified
 
+    // HLVDL
+    HLVDCONbits.HLVDEN=0; // disable hlvd module
+    HLVDCONbits.HLVDL3=1; // these bits set a typical voltage threshold of 4.8v
+    HLVDCONbits.HLVDL2=1;
+    HLVDCONbits.HLVDL1=0;
+    HLVDCONbits.HLVDL0=1;
+    HLVDCONbits.VDIRMAG=0; // detect low voltage
+    HLVDCONbits.HLVDEN=1;  // re-enable hlvd module
+    PIR2bits.HLVDIF=0;     // reset interrupt flag
+
     msec=0;
     last_msec=0;
     eeprom_addr = 0;
     //gsr = 0;
+
+
+// NEED TO SET PRESERVE EEPROM MEMORY IN MPLAB (programmer->config)!
+/*
+{
+    unsigned char c;
+    //WritePicEEPROM(0,18);
+    c=ReadPicEEPROM(0);
+
+    if(c!=18) PrintInfoROM("ROSSZ");
+    else PrintInfoROM("JO");
+while(1);
+}
+*/
+    // Read name from PIC EEPROM
+    ReadName(); 
 
     InitMeas(); 
 
@@ -1072,7 +1111,18 @@ while(1);
 
         ProcessIO();
 
+        USBDeviceTasks(); // only in poll mode
+
         if(intf) {
+
+           //tick += n_inth;
+           n_inth=0;
+
+           //fmsec += dt * nn;
+           
+           fmsec = tick * dt;
+           msec = (unsigned long)fmsec;
+
            intf=0;
 
            ProcessSw();
@@ -1086,7 +1136,7 @@ while(1);
          
            //OSCCONbits.IDLEN=0;
            //TEST_LED = 0;
-           Sleep();        
+           //Sleep();                         ///////////////!!!!!!!!!!!!!!!
            //TEST_LED = 1;
         } 
 
@@ -1269,9 +1319,8 @@ void ProcessIO(void)
 
                     USBDeviceDetach();
                     HardReset();
-                    USBDeviceAttach();
-                    return;
-	                
+
+                    USBDeviceAttach();	                
 					ToSendDataBuffer[0] = 0x41;
 
 	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
@@ -1322,10 +1371,9 @@ void ProcessIO(void)
                     c = (unsigned char*) &msec;
  
 					ToSendDataBuffer[0] = 0x50;  	//Echo back to the host the command we are fulfilling in the first byte.
-					ToSendDataBuffer[1] = c[0];
-					ToSendDataBuffer[2] = c[1]; 
-                    ToSendDataBuffer[3] = c[2];
-					ToSendDataBuffer[4] = c[3]; 
+
+                    memcpy((const void far *)ToSendDataBuffer+1 , (const void far *)(&msec), 4);
+                    memcpy((const void far *)ToSendDataBuffer+1+4 , (const void far *)(&tick), 4);
 
 	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
                 }
@@ -1424,6 +1472,30 @@ void ProcessIO(void)
 	                 
 					ToSendDataBuffer[0] = 0x70;
 
+	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
+                }
+                break;
+
+            case 0x80:	// Write name to PIC
+                {
+                    memcpy((void far *)name, (const void far *)(ReceivedDataBuffer+1), 16);
+                    WriteName();
+                    ReadName();
+
+                    //PrintInfo(name);
+
+	                while(HIDTxHandleBusy(USBInHandle)) ;	                 
+					ToSendDataBuffer[0] = 0x80;
+	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
+                }
+                break;
+
+            case 0x81:	// Read name from PIC
+                {
+                    memcpy((const void far *)ToSendDataBuffer+1 , name, 16);
+
+	                while(HIDTxHandleBusy(USBInHandle)) ;	                 
+					ToSendDataBuffer[0] = 0x81;
 	                USBInHandle = HIDTxPacket(HID_EP,(BYTE*)&ToSendDataBuffer[0],USBSIZE);	                					
                 }
                 break;
